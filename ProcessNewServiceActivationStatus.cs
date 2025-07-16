@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Linq;
@@ -215,6 +215,37 @@ namespace AltaworxDeviceBulkChange
                             IsSuccess = false
                         };
                     }
+
+                    //update
+                    if (activationStatusResponse.ResponseObject.All(res => res.Service.Name == "/service/"))
+                    {
+                        bool hasPhysicalSIM = iccidList.Any(iccid => !string.IsNullOrWhiteSpace(iccid));
+                        if (hasPhysicalSIM)
+                        {
+                            string errorMessage = $"Telegence: Activation failed because device needs eSIM profile. ICCID not valid.";
+                            logRepo.AddMobilityLogEntry(new CreateMobilityDeviceBulkChangeLog
+                            {
+                                BulkChangeId = bulkChangeId,
+                                ErrorText = errorMessage,
+                                HasErrors = true,
+                                LogEntryDescription = "Activation Failed - eSIM Required",
+                                MobilityDeviceChangeId = changes.First().Id,
+                                ProcessBy = "AltaworxDeviceBulkChange",
+                                ProcessedDate = DateTime.UtcNow,
+                                RequestText = $"ICCIDs: {string.Join(",", iccidList)}",
+                                ResponseStatus = BulkChangeStatus.ERROR,
+                                ResponseText = "/service/" // what carrier gave us
+                            });
+
+                            return new TelegenceActivationApiResponse
+                            {
+                                ICCIDList = iccidList,
+                                Response = errorMessage,
+                                IsSuccess = false
+                            };
+                        }
+                    }
+                    //upto here
 
                     bool isRequestProcessed = activationStatusResponse.ResponseObject.All(res =>
                                                 res.Service.Status.ToLower() != TelegenceActivationServiceStatus.Pending
