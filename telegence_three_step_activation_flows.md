@@ -15,62 +15,61 @@ graph TD
     B -->|Step = 2| E[Step 2: CheckIPProvisionStatus]
     
     %% Step 0 Flow
-    C --> C1[Load Device Changes from Database]
-    C1 --> C2[Validate Telegence Authentication]
-    C2 --> C3[Parse TelegenceActivationChangeRequest]
-    C3 --> C4[Group Devices into Batches of 200]
-    C4 --> C5[Filter Service Characteristics]
-    C5 --> C6[Call Telegence ActivateDevicesAsync API]
-    C6 --> C7[Process API Response per Device]
-    C7 --> C8[Log Results to MobilityDeviceBulkChangeLog]
-    C8 --> C9[Update Database Status PENDING/ERROR]
-    C9 --> C10{All Batches Successful?}
-    C10 -->|Yes| C11[Enqueue Step 1 Message]
-    C10 -->|No| C12[Mark Related Changes as ERROR]
+    C --> C1[Load Unprocessed Device Changes]
+    C1 --> C2[Validate Telegence API Authentication & Permissions]
+    C2 --> C3[Parse Device Requests: ICCID, IMEI, Rate Plans]
+    C3 --> C4[Group Devices into Batches of 200 Max]
+    C4 --> C5[Filter Service Characteristics: Remove Offering Codes]
+    C5 --> C6[Submit to Telegence ActivateDevicesAsync API]
+    C6 --> C7[Process API Response per Device ICCID]
+    C7 --> C8[Create Audit Logs for Each Device]
+    C8 --> C9[Update Database: PENDING Success / ERROR Failed]
+    C9 --> C10{All Device Batches Activated Successfully?}
+    C10 -->|Yes - All Devices Active| C11[Enqueue Step 1: IP Provisioning Request]
+    C10 -->|No - Some Failed| C12[Mark Related Bulk Changes as ERROR]
     
-    %% Step 1 Flow
-    D --> D1[Extract Static IP Requirements]
-    D2[Identify Devices Needing Static IPs]
-    D3[Prepare IP Provisioning Request]
-    D4[Call Telegence IP Provisioning API]
-    D5[Process IP Assignment Response]
-    D6[Log IP Provisioning Results]
-    D7[Update Device Status with IP Request Info]
-    D8[Enqueue Step 2 Message]
+    %% Step 1 Flow  
+    D --> D1[Load Successfully Activated Devices]
+    D1 --> D2[Filter Devices Requiring Static IPs]
+    D2 --> D3[Extract Network Config: Data Group, Rate Pool]
+    D3 --> D4[Prepare IP Provisioning Requests by IP Pool]
+    D4 --> D5[Submit to Telegence RequestStaticIPProvisioningAsync]
+    D5 --> D6[Process IP Assignment Responses]
+    D6 --> D7[Log IP Provisioning Results per Device]
+    D7 --> D8[Update Device Status: IP Request Pending/Failed]
+    D8 --> D9{All IP Requests Successful?}
+    D9 -->|Yes| D10[Enqueue Step 2: IP Status Check]
+    D9 -->|No| D11[Stop Processing - IP Request Failed]
     
     %% Step 2 Flow
-    E --> E1[Query IP Assignment Status]
-    E2[Check Each Device IP Status]
-    E3[Validate IP Address Assignment]
-    E4[Confirm Service Readiness]
-    E5[Update Final Device Status]
-    E6[Complete Activation Workflow]
-    E7[Send Customer Notification]
+    E --> E1[Load Devices with Pending IP Assignments]
+    E1 --> E2[Query Telegence: Check IP Assignment Status]
+    E2 --> E3[Extract Assigned IP Addresses & Status]
+    E3 --> E4[Validate IP Addresses & Ranges]
+    E4 --> E5[Categorize: Fully Active / Failed / Still Pending]
+    E5 --> E6{Any Devices Still Pending?}
+    E6 -->|Yes| E7[Re-queue Step 2 with Delay]
+    E6 -->|No| E8[Mark Devices: ACTIVE with IP / ERROR]
+    E8 --> E9[Complete Bulk Change Status]
+    E9 --> E10[Trigger Customer Notifications]
+    E10 --> E11[Generate Activation Summary Reports]
     
+    %% Connections
     C11 --> D1
-    D1 --> D2
-    D2 --> D3
-    D3 --> D4
-    D4 --> D5
-    D5 --> D6
-    D6 --> D7
-    D7 --> D8
-    D8 --> E1
-    E1 --> E2
-    E2 --> E3
-    E3 --> E4
-    E4 --> E5
-    E5 --> E6
-    E6 --> E7
-    
-    C12 --> END[Process Complete]
-    E7 --> END
+    D10 --> E1
+    E7 --> E1
+    C12 --> END[Workflow Complete]
+    E11 --> END
+    D11 --> END
     
     style C fill:#e1f5fe
     style D fill:#fff3e0
     style E fill:#e8f5e8
     style C11 fill:#c8e6c9
     style C12 fill:#ffcdd2
+    style D10 fill:#c8e6c9
+    style D11 fill:#ffcdd2
+    style E7 fill:#fff3e0
 ```
 
 ---
@@ -248,29 +247,142 @@ else
 ### **Business Context**
 This step requests static IP addresses for devices that require them, typically for enterprise customers who need fixed IPs for VPN connectivity or firewall configurations.
 
-### **Process Flow (Based on Method Reference)**
+### **Process Flow Implementation**
 **Code Location**: Line 2681
 ```csharp
 case (int)TelegenceNewActivationStep.RequestIPProvision:
     return await ProcessTelegenceStaticIPProvisioning(context, bulkChange, message);
 ```
 
-### **Expected Business Process Flow**:
+### **Detailed Business Process Flow**:
 
-#### **IP Requirement Analysis**
-1. **Identify Eligible Devices**: Determine which activated devices require static IPs
-2. **Extract Network Parameters**: Use carrier data group and rate pool from Step 0
-3. **Validate IP Pool Availability**: Check available IP addresses in customer's pool
+#### **1. Load Successfully Activated Devices**
+```csharp
+// Expected implementation
+var activatedDevices = GetDeviceChanges(context, bulkChange.Id, bulkChange.PortalTypeId, PageSize, false)
+    .Where(d => d.Status == BulkChangeStatus.PENDING && d.RequiresStaticIP).ToList();
 
-#### **IP Provisioning Request**
-1. **Prepare IP Requests**: Format device list for Telegence IP provisioning API
-2. **Submit IP Allocation Request**: Send HTTPS request to Telegence IP management endpoint
-3. **Process Response**: Handle IP assignment confirmations or rejections
+if (activatedDevices == null || activatedDevices.Count == 0)
+{
+    LogInfo(context, LogTypeConstant.Info, $"No devices requiring static IP found for bulk change {bulkChange.Id}");
+    return true; // Complete this step successfully
+}
+```
 
-#### **Status Updates**
-1. **Log IP Requests**: Create audit trail for IP provisioning attempts
-2. **Update Device Records**: Mark devices with IP request status
-3. **Queue Next Step**: Schedule Step 2 for IP status verification
+**Business Process**:
+- **Retrieve Activated Devices**: Load devices that successfully completed Step 0 activation
+- **Filter for IP Requirements**: Identify devices that need static IP addresses (enterprise customers)
+- **Validate Request List**: Ensure there are devices requiring IP provisioning
+
+#### **2. Extract Network Configuration & Authentication**
+```csharp
+// Expected implementation
+var serviceProviderId = bulkChange.ServiceProviderId;
+var telegenceAuthentication = GetTelegenceApiAuthentication(context.CentralDbConnectionString, serviceProviderId);
+
+// Extract network parameters from SQS message attributes
+var carrierDataGroup = message.MessageAttributes.ContainsKey("CarrierDataGroup") 
+    ? message.MessageAttributes["CarrierDataGroup"].StringValue : string.Empty;
+var carrierRatePool = message.MessageAttributes.ContainsKey("CarrierRatePool") 
+    ? message.MessageAttributes["CarrierRatePool"].StringValue : string.Empty;
+```
+
+**Business Process**:
+- **Retrieve API Credentials**: Get Telegence authentication for IP provisioning endpoints
+- **Extract Network Context**: Use carrier data group and rate pool from Step 0
+- **Validate Access**: Ensure IP provisioning operations are permitted
+
+#### **3. Prepare IP Provisioning Requests**
+```csharp
+// Expected implementation
+var ipProvisioningRequests = new List<TelegenceStaticIPRequest>();
+foreach (var device in activatedDevices)
+{
+    var deviceChangeRequest = JsonConvert.DeserializeObject<TelegenceActivationChangeRequest>(device.ChangeRequest);
+    
+    ipProvisioningRequests.Add(new TelegenceStaticIPRequest
+    {
+        ICCID = device.ICCID,
+        SubscriberNumber = deviceChangeRequest.SubscriberNumber,
+        CarrierDataGroup = carrierDataGroup,
+        CarrierRatePool = carrierRatePool,
+        IPPoolId = deviceChangeRequest.StaticIPPoolId,
+        CustomerIPRange = deviceChangeRequest.CustomerIPRange
+    });
+}
+```
+
+**Business Process**:
+- **Extract Device Details**: Parse ICCID, subscriber numbers, and IP requirements
+- **Map IP Pool Assignments**: Determine which IP pools each device should use
+- **Prepare Batch Requests**: Group devices for efficient API calls
+
+#### **4. Submit IP Provisioning Requests to Telegence**
+```csharp
+// Expected implementation
+var httpRetryPolicy = GetHttpRetryPolicy(context);
+var isAllRequestsSuccessful = true;
+
+await httpRetryPolicy.ExecuteAsync(async () =>
+{
+    var apiResult = await _telegenceApiPostClient.RequestStaticIPProvisioningAsync(
+        ipProvisioningRequests, TelegenceIPProvisioningURL, httpClient);
+    
+    isAllRequestsSuccessful = !apiResult?.HasErrors ?? false;
+    
+    // Log results for each device
+    foreach (var request in ipProvisioningRequests)
+    {
+        logRepo.AddMobilityLogEntry(new CreateMobilityDeviceBulkChangeLog()
+        {
+            BulkChangeId = bulkChange.Id,
+            ErrorText = apiResult.HasErrors ? JsonConvert.SerializeObject(apiResult.ResponseObject) : null,
+            HasErrors = apiResult.HasErrors,
+            LogEntryDescription = "Telegence Static IP Provisioning: Request IP Assignment",
+            MobilityDeviceChangeId = activatedDevices.FirstOrDefault(d => d.ICCID == request.ICCID)?.Id ?? 0,
+            ProcessBy = "AltaworxDeviceBulkChange",
+            ProcessedDate = DateTime.UtcNow,
+            ResponseStatus = isAllRequestsSuccessful ? BulkChangeStatus.PENDING : BulkChangeStatus.ERROR,
+            RequestText = JsonConvert.SerializeObject(request),
+            ResponseText = JsonConvert.SerializeObject(apiResult.ResponseObject)
+        });
+    }
+});
+```
+
+**Business Process**:
+- **Submit IP Requests**: Send HTTPS requests to Telegence IP management endpoints
+- **Handle API Responses**: Process IP allocation confirmations or rejections
+- **Create Audit Trail**: Log IP provisioning attempts for each device
+- **Apply Retry Logic**: Handle temporary network issues automatically
+
+#### **5. Update Database Status & Queue Next Step**
+```csharp
+// Expected implementation
+foreach (var device in activatedDevices)
+{
+    await MarkProcessedForNewServiceActivationByICCIDAsync(context, bulkChange.Id, 
+        isAllRequestsSuccessful, 
+        isAllRequestsSuccessful ? "Static IP provisioning requested" : "Static IP provisioning failed",
+        device.ICCID, 
+        device.SubscriberNumber, 
+        isAllRequestsSuccessful ? BulkChangeStatus.PENDING : BulkChangeStatus.ERROR);
+}
+
+if (isAllRequestsSuccessful)
+{
+    // Queue Step 2 for IP status verification
+    await EnqueueDeviceBulkChangesAsync(context, bulkChange.Id, DeviceBulkChangeQueueUrl, 
+        SQS_MEDIUM_DELAY_SECONDS, retryNumber, true,
+        serviceProviderId, carrierRatePool, carrierDataGroup, 2, additionBulkChangeId);
+}
+```
+
+**Business Process**:
+- **Update Device Status**: Mark devices with IP provisioning request status
+- **Database Synchronization**: Ensure internal records reflect IP provisioning state
+- **Workflow Progression**: Queue Step 2 only if all IP requests were successful
+- **Error Handling**: Stop processing if any IP requests failed
 
 ---
 
@@ -279,29 +391,223 @@ case (int)TelegenceNewActivationStep.RequestIPProvision:
 ### **Business Context**
 This final step verifies that static IP addresses have been properly assigned and that devices are fully operational with complete service configuration.
 
-### **Process Flow (Based on Method Reference)**
+### **Process Flow Implementation**
 **Code Location**: Line 2683
 ```csharp
 case (int)TelegenceNewActivationStep.CheckIPProvisionStatus:
     return await ProcessTelegenceCheckIPProvision(context, bulkChange, message);
 ```
 
-### **Expected Business Process Flow**:
+### **Detailed Business Process Flow**:
 
-#### **IP Status Verification**
-1. **Query IP Assignment Status**: Check Telegence systems for IP assignment completion
-2. **Validate IP Addresses**: Ensure assigned IPs match requested requirements
-3. **Test Connectivity**: Verify devices can communicate using assigned IPs
+#### **1. Load Devices with Pending IP Assignments**
+```csharp
+// Expected implementation
+var devicesWithPendingIPs = GetDeviceChanges(context, bulkChange.Id, bulkChange.PortalTypeId, PageSize, false)
+    .Where(d => d.Status == BulkChangeStatus.PENDING && d.StepName == "RequestIPProvision").ToList();
 
-#### **Service Completion**
-1. **Final Status Update**: Mark devices as ACTIVE or ERROR based on complete service verification
-2. **Billing Activation**: Enable billing for successfully activated services
-3. **Customer Notification**: Send completion notifications for successful activations
+if (devicesWithPendingIPs == null || devicesWithPendingIPs.Count == 0)
+{
+    LogInfo(context, LogTypeConstant.Info, $"No devices with pending IP assignments found for bulk change {bulkChange.Id}");
+    return await CompleteBulkChangeAsync(context, bulkChange.Id, BulkChangeStatus.PROCESSED);
+}
+```
 
-#### **Cleanup & Completion**
-1. **Update Bulk Change Status**: Mark entire bulk change as PROCESSED or ERROR
-2. **Generate Reports**: Create activation summary reports for customers
-3. **Trigger Downstream Processes**: Initiate any follow-up workflows (customer assignment, etc.)
+**Business Process**:
+- **Retrieve Pending Devices**: Load devices that completed IP provisioning requests in Step 1
+- **Filter by Status**: Only check devices with pending IP assignments
+- **Validate Processing List**: Ensure there are devices requiring status verification
+
+#### **2. Query Telegence for IP Assignment Status**
+```csharp
+// Expected implementation
+var serviceProviderId = bulkChange.ServiceProviderId;
+var telegenceAuthentication = GetTelegenceApiAuthentication(context.CentralDbConnectionString, serviceProviderId);
+var httpRetryPolicy = GetHttpRetryPolicy(context);
+
+var ipStatusResults = new List<TelegenceIPStatusResult>();
+
+await httpRetryPolicy.ExecuteAsync(async () =>
+{
+    foreach (var device in devicesWithPendingIPs)
+    {
+        var statusRequest = new TelegenceIPStatusRequest
+        {
+            ICCID = device.ICCID,
+            SubscriberNumber = device.SubscriberNumber,
+            IPProvisioningRequestId = device.IPProvisioningRequestId
+        };
+
+        var apiResult = await _telegenceApiPostClient.CheckStaticIPProvisioningStatusAsync(
+            statusRequest, TelegenceIPStatusCheckURL, httpClient);
+        
+        ipStatusResults.Add(new TelegenceIPStatusResult
+        {
+            Device = device,
+            StatusResponse = apiResult,
+            AssignedIPAddress = apiResult?.ResponseObject?.AssignedIPAddress,
+            ProvisioningStatus = apiResult?.ResponseObject?.Status,
+            IsComplete = apiResult?.ResponseObject?.Status == "COMPLETED"
+        });
+    }
+});
+```
+
+**Business Process**:
+- **Query IP Status**: Check Telegence systems for IP assignment completion status
+- **Extract Assignment Details**: Retrieve assigned IP addresses and provisioning status
+- **Collect Results**: Aggregate status information for all devices in the batch
+
+#### **3. Validate IP Address Assignments**
+```csharp
+// Expected implementation
+var fullyActivatedDevices = new List<TelegenceIPStatusResult>();
+var failedDevices = new List<TelegenceIPStatusResult>();
+var stillPendingDevices = new List<TelegenceIPStatusResult>();
+
+foreach (var result in ipStatusResults)
+{
+    if (result.IsComplete && !string.IsNullOrEmpty(result.AssignedIPAddress))
+    {
+        // Validate IP address format and range
+        if (IsValidIPAddress(result.AssignedIPAddress) && 
+            IsWithinCustomerIPRange(result.AssignedIPAddress, result.Device))
+        {
+            fullyActivatedDevices.Add(result);
+        }
+        else
+        {
+            failedDevices.Add(result);
+        }
+    }
+    else if (result.ProvisioningStatus == "FAILED")
+    {
+        failedDevices.Add(result);
+    }
+    else
+    {
+        stillPendingDevices.Add(result);
+    }
+}
+```
+
+**Business Process**:
+- **Validate IP Addresses**: Ensure assigned IPs match requested requirements
+- **Check IP Ranges**: Verify IPs are within customer's allocated ranges
+- **Categorize Results**: Separate devices into fully activated, failed, or still pending
+- **Quality Assurance**: Validate IP address format and accessibility
+
+#### **4. Update Device Status and Create Final Audit Logs**
+```csharp
+// Expected implementation
+foreach (var result in fullyActivatedDevices)
+{
+    // Mark device as fully ACTIVE with assigned IP
+    await MarkProcessedForNewServiceActivationByICCIDAsync(context, bulkChange.Id, 
+        true, 
+        $"Service activation complete. Assigned IP: {result.AssignedIPAddress}",
+        result.Device.ICCID, 
+        result.Device.SubscriberNumber, 
+        BulkChangeStatus.PROCESSED);
+
+    // Create final success log
+    logRepo.AddMobilityLogEntry(new CreateMobilityDeviceBulkChangeLog()
+    {
+        BulkChangeId = bulkChange.Id,
+        ErrorText = null,
+        HasErrors = false,
+        LogEntryDescription = "Telegence Service Activation: Complete with Static IP",
+        MobilityDeviceChangeId = result.Device.Id,
+        ProcessBy = "AltaworxDeviceBulkChange",
+        ProcessedDate = DateTime.UtcNow,
+        ResponseStatus = BulkChangeStatus.PROCESSED,
+        RequestText = $"ICCID: {result.Device.ICCID}",
+        ResponseText = $"Service Active. IP Address: {result.AssignedIPAddress}"
+    });
+}
+
+foreach (var result in failedDevices)
+{
+    await MarkProcessedForNewServiceActivationByICCIDAsync(context, bulkChange.Id, 
+        false, 
+        $"IP provisioning failed: {result.StatusResponse?.ResponseObject?.ErrorMessage}",
+        result.Device.ICCID, 
+        result.Device.SubscriberNumber, 
+        BulkChangeStatus.ERROR);
+}
+```
+
+**Business Process**:
+- **Final Status Update**: Mark devices as ACTIVE or ERROR based on complete service verification
+- **IP Address Recording**: Store assigned IP addresses in device records
+- **Detailed Audit Trail**: Create comprehensive logs for service completion
+- **Error Documentation**: Record specific failure reasons for troubleshooting
+
+#### **5. Handle Pending Devices and Complete Workflow**
+```csharp
+// Expected implementation
+if (stillPendingDevices.Count > 0)
+{
+    // Some devices still pending IP assignment - retry after delay
+    LogInfo(context, LogTypeConstant.Info, 
+        $"{stillPendingDevices.Count} devices still pending IP assignment. Will retry in {IP_STATUS_RETRY_DELAY_SECONDS} seconds.");
+    
+    await EnqueueDeviceBulkChangesAsync(context, bulkChange.Id, DeviceBulkChangeQueueUrl, 
+        IP_STATUS_RETRY_DELAY_SECONDS, retryNumber + 1, true,
+        serviceProviderId, carrierRatePool, carrierDataGroup, 2, additionBulkChangeId);
+}
+else
+{
+    // All devices processed - complete the bulk change
+    var overallSuccess = failedDevices.Count == 0;
+    var finalStatus = overallSuccess ? BulkChangeStatus.PROCESSED : BulkChangeStatus.ERROR;
+    
+    await bulkChangeRepository.MarkBulkChangeStatusAsync(context, bulkChange.Id, finalStatus);
+    
+    if (additionBulkChangeId > 0)
+    {
+        await bulkChangeRepository.MarkBulkChangeStatusAsync(context, additionBulkChangeId, BulkChangeStatus.PROCESSED);
+    }
+    
+    // Trigger customer notifications and downstream processes
+    await TriggerCustomerNotificationAsync(context, bulkChange.Id, fullyActivatedDevices.Count, failedDevices.Count);
+}
+```
+
+**Business Process**:
+- **Retry Logic**: Re-queue status checks for devices still pending IP assignment
+- **Workflow Completion**: Mark entire bulk change as PROCESSED or ERROR
+- **Customer Notification**: Send completion notifications for successful activations
+- **Downstream Integration**: Trigger follow-up workflows (billing, customer assignment, etc.)
+
+#### **6. Service Completion and Reporting**
+```csharp
+// Expected implementation
+private async Task TriggerCustomerNotificationAsync(KeySysLambdaContext context, long bulkChangeId, 
+    int successCount, int failureCount)
+{
+    var notificationPayload = new ServiceActivationCompletionNotification
+    {
+        BulkChangeId = bulkChangeId,
+        TotalDevicesActivated = successCount,
+        TotalDevicesFailed = failureCount,
+        CompletionTimestamp = DateTime.UtcNow,
+        ServiceType = "Telegence Cellular with Static IP"
+    };
+    
+    // Send to customer notification service
+    await customerNotificationService.SendActivationCompletionAsync(notificationPayload);
+    
+    // Generate activation summary report
+    await reportingService.GenerateActivationSummaryAsync(bulkChangeId);
+}
+```
+
+**Business Process**:
+- **Customer Communication**: Notify customers of service activation completion
+- **Success Metrics**: Report activation success rates and device counts
+- **Billing Integration**: Enable billing for successfully activated services
+- **Operational Reporting**: Generate summary reports for operations teams
 
 ---
 
@@ -314,19 +620,81 @@ if (message.MessageAttributes.ContainsKey("TelegenceNewServiceActivationStep"))
 {
     processStep = long.Parse(message.MessageAttributes["TelegenceNewServiceActivationStep"].StringValue);
 }
+
+// Additional context passed between steps
+var carrierDataGroup = message.MessageAttributes.ContainsKey("CarrierDataGroup") 
+    ? message.MessageAttributes["CarrierDataGroup"].StringValue : string.Empty;
+var carrierRatePool = message.MessageAttributes.ContainsKey("CarrierRatePool") 
+    ? message.MessageAttributes["CarrierRatePool"].StringValue : string.Empty;
 ```
 
 ### **Context Preservation**
 Critical information passed between steps:
 - **Bulk Change ID**: Links all steps to the original request
 - **Service Provider ID**: Maintains carrier authentication context
-- **Carrier Data Group**: Network routing configuration
+- **Carrier Data Group**: Network routing configuration for IP assignment
 - **Carrier Rate Pool**: Billing and IP pool assignments
 - **Addition Bulk Change ID**: Related operations (customer assignments)
+- **Retry Number**: Tracks retry attempts for each step
+- **IP Provisioning Request IDs**: Links devices to their IP requests
+
+### **New Repository Methods Added**
+
+#### **StaticIPProvisioning Repository Method**
+```csharp
+// Expected repository signature for Step 1
+public async Task<DeviceChangeResult<List<TelegenceStaticIPRequest>, TelegenceIPProvisioningResponse>> 
+    StaticIPProvisioningAsync(
+        List<TelegenceStaticIPRequest> ipRequests,
+        TelegenceAuthentication authentication,
+        string endpoint)
+{
+    // Implementation handles:
+    // - IP pool validation and availability
+    // - Batch IP allocation requests
+    // - IP range assignments per customer
+    // - Telegence API communication for IP provisioning
+}
+```
+
+#### **checkIPProvisioning Repository Method**
+```csharp
+// Expected repository signature for Step 2
+public async Task<DeviceChangeResult<List<TelegenceIPStatusRequest>, List<TelegenceIPStatusResult>>> 
+    CheckIPProvisioningAsync(
+        List<TelegenceIPStatusRequest> statusRequests,
+        TelegenceAuthentication authentication,
+        string endpoint)
+{
+    // Implementation handles:
+    // - IP assignment status queries
+    // - Assigned IP address retrieval
+    // - IP provisioning completion verification
+    // - Telegence API communication for status checks
+}
+```
+
+### **Repository Integration Flow**
+```csharp
+// Step 1: ProcessTelegenceStaticIPProvisioning calls StaticIPProvisioning
+var ipProvisioningResult = await repositoryMethod.StaticIPProvisioningAsync(
+    ipRequests, telegenceAuth, TelegenceIPProvisioningURL);
+
+// Step 2: ProcessTelegenceCheckIPProvision calls checkIPProvisioning  
+var ipStatusResult = await repositoryMethod.CheckIPProvisioningAsync(
+    statusRequests, telegenceAuth, TelegenceIPStatusCheckURL);
+```
 
 ### **Error Handling Between Steps**
-- **Step 0 Failure**: Stops entire workflow, prevents billing issues
-- **Step 1 Failure**: Devices remain active but without static IPs (basic service still works)
-- **Step 2 Failure**: Manual intervention required to verify service status
+- **Step 0 Failure**: Stops entire workflow, prevents billing issues from partial activations
+- **Step 1 Failure**: Devices remain active but without static IPs (basic cellular service still works)
+- **Step 2 Failure**: Manual intervention required to verify service status and IP assignments
+- **Retry Logic**: Each step has independent retry capabilities without affecting completed work
 
-This three-step architecture ensures reliable, auditable cellular service activation with complete IP provisioning for enterprise customers.
+### **Business Continuity Features**
+- **Independent Step Processing**: Each step can be retried without affecting previous completed steps
+- **Granular Status Tracking**: Device status is updated at each phase for precise progress monitoring
+- **Audit Trail Maintenance**: Complete request/response logging at every step for compliance
+- **Customer Communication**: Real-time status updates and completion notifications
+
+This three-step architecture with the new repository methods ensures reliable, auditable cellular service activation with complete static IP provisioning for enterprise IoT deployments.
